@@ -3,7 +3,7 @@
 // For use on NQ1! or MNQ1! 5-minute chart
 // Marks: PDH/PDL, Opening Range, VWAP, EMA, 10AM candle, sweep detection
 
-//@version=5
+//@version=6
 indicator(title="Powell 10AM — V1 Indicator", shorttitle="P10AM_V1", overlay=true, max_lines_count=100, max_labels_count=100)
 
 // ─────────────────────────────────────────────────────────────────────────────

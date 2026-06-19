@@ -23,7 +23,7 @@
 // 10-min bar's low (9:30–9:40), a higher-low structure is confirmed (bullish).
 // The OR Low is used as a fallback / secondary reference.
 
-//@version=5
+//@version=6
 strategy(
      title              = "Powell 10AM — 1-Min Precision Entry (NQ/MNQ)",
      shorttitle         = "P10AM_1M",
@@ -105,7 +105,7 @@ day_ok          = not (skip_friday and ny_dow == 6)
 ema_val          = ta.ema(close, ema_len)
 
 plot(show_vwap_line ? vwap_val : na, "VWAP",                color=color.new(color.purple, 0), linewidth=2)
-plot(show_ema_line  ? ema_val  : na, "EMA " + str.tostring(ema_len), color=color.new(color.orange, 0), linewidth=1)
+plot(show_ema_line  ? ema_val  : na, "EMA", color=color.new(color.orange, 0), linewidth=1)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PREVIOUS DAY HIGH / LOW

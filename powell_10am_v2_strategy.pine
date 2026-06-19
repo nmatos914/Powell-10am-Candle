@@ -3,7 +3,7 @@
 // For use on NQ1! or MNQ1! 5-minute chart
 // Includes: CISD entry, SMT divergence, scaled exits, prop-firm-safe risk management
 
-//@version=5
+//@version=6
 strategy(
      title              = "Powell 10AM — V2.0 Strategy (NQ/MNQ)",
      shorttitle         = "P10AM_V2",
@@ -143,7 +143,7 @@ plot(show_vwap ? vwap_val : na, "VWAP", color=color.new(color.purple, 0), linewi
 // ─────────────────────────────────────────────────────────────────────────────
 
 ema_val = ta.ema(close, ema_len)
-plot(show_ema ? ema_val : na, "EMA " + str.tostring(ema_len), color=color.new(color.orange, 0), linewidth=1)
+plot(show_ema ? ema_val : na, "EMA", color=color.new(color.orange, 0), linewidth=1)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ATR
