@@ -13,8 +13,9 @@ A complete, rule-based institutional futures trading system built around the 10:
 | File | Description |
 |------|-------------|
 | `STRATEGY_RULES.md` | Complete strategy framework — all rules, logic, examples, and Version 2.0 |
-| `powell_10am_v1_indicator.pine` | TradingView indicator — visual overlay for manual trading |
-| `powell_10am_v2_strategy.pine` | TradingView strategy — full backtesting with automated entries/exits |
+| `powell_10am_v1_indicator.pine` | TradingView indicator — visual overlay for manual trading (5-min chart) |
+| `powell_10am_v2_strategy.pine` | TradingView strategy — full backtesting with automated entries/exits (5-min chart) |
+| `powell_10am_1min_entry.pine` | TradingView strategy — 1-minute precision entry using the 10-min higher low sweep |
 | `TRADE_CHECKLIST.md` | One-page live trading checklist |
 
 ---
@@ -50,6 +51,13 @@ The inverse applies for shorts.
 - Enter at open of bar after that CISD confirmation candle
 - Stop: 3 pts below CISD bar low (tighter than V1)
 - Same targets as V1 but higher win rate
+
+### 1-Minute Entry (Best R:R)
+- Same bias and key-level logic, but the chart is 1-minute
+- A state machine watches the sweep develop bar-by-bar after 10:00 AM
+- Entry fires the moment the first 1-min candle **closes back above** the 10-min higher low
+- Stop: 2 pts beyond the actual 1-min wick extreme (often 5–10 pts vs 15–25 pts on 5-min)
+- The move target is the same size, so R:R is structurally 2–4× better
 
 ### Key Filters
 - VWAP direction at 9:55 AM (required)

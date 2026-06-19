@@ -1,0 +1,559 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Powell 10AM Strategy — 1-Minute Precision Entry
+//
+// TIMEFRAME: 1-minute chart (NQ1! or MNQ1!)
+//
+// HOW THIS DIFFERS FROM THE 5-MIN STRATEGY
+// ──────────────────────────────────────────
+// The 5-min strategy waits for the entire 10:00 AM 5-min candle to close, then
+// enters at 10:05. This costs 4 minutes and requires a stop sized to the full
+// 5-min wick — often 15–30 NQ points.
+//
+// This script drops to the 1-min chart and tracks the sweep bar-by-bar using a
+// state machine. Entry fires the moment the FIRST 1-min candle closes BACK ABOVE
+// the swept level. The stop is placed 2 points beyond the 1-min wick extreme.
+// The result is a structurally identical setup with 3–5× tighter risk, producing
+// dramatically better R:R on the same underlying move.
+//
+// KEY LEVEL — THE 10-MINUTE HIGHER LOW
+// ──────────────────────────────────────
+// The sweep target is the most recent 10-minute bar's LOW before 10 AM. On a
+// 1-min chart at 9:59, the last closed 10-min bar is 9:40–9:50, whose low is the
+// "10-min higher low" the trader is watching. If that low is ABOVE the prior
+// 10-min bar's low (9:30–9:40), a higher-low structure is confirmed (bullish).
+// The OR Low is used as a fallback / secondary reference.
+
+//@version=5
+strategy(
+     title              = "Powell 10AM — 1-Min Precision Entry (NQ/MNQ)",
+     shorttitle         = "P10AM_1M",
+     overlay            = true,
+     calc_on_every_tick = false,
+     default_qty_type   = strategy.fixed,
+     default_qty_value  = 1,
+     initial_capital    = 50000,
+     currency           = currency.USD,
+     commission_type    = strategy.commission.cash_per_contract,
+     commission_value   = 2.05,
+     slippage           = 1,
+     pyramiding         = 0,
+     max_lines_count    = 200,
+     max_labels_count   = 200)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+grp_risk   = "Risk Management"
+grp_entry  = "Entry Settings"
+grp_filter = "Filters"
+grp_smt    = "SMT Divergence"
+grp_visual = "Visuals"
+
+risk_pct       = input.float(1.0,   "Risk Per Trade (%)",                    group=grp_risk, minval=0.25, maxval=3.0, step=0.25)
+tp1_r          = input.float(1.0,   "Target 1 (R)",                          group=grp_risk, minval=0.5, step=0.5)
+tp2_r          = input.float(2.0,   "Target 2 (R)",                          group=grp_risk, minval=1.0, step=0.5)
+tp1_exit_pct   = input.float(33.0,  "Exit % at Target 1",                    group=grp_risk, minval=10, maxval=100, step=5)
+tp2_exit_pct   = input.float(33.0,  "Exit % at Target 2",                    group=grp_risk, minval=10, maxval=100, step=5)
+stop_buffer    = input.float(2.0,   "Stop Buffer Beyond 1-Min Wick (pts)",   group=grp_risk, minval=0.5, step=0.5)
+max_hold_hour  = input.int(12,      "Max Hold Hour (NY)",                    group=grp_risk, minval=10, maxval=15)
+
+min_sweep_pts  = input.float(3.0,   "Min Sweep Size (NQ pts)",               group=grp_entry, minval=1.0, step=0.5)
+entry_window   = input.int(15,      "Entry Window (min after 10:00)",        group=grp_entry, minval=5, maxval=30)
+use_10m_level  = input.bool(true,   "Use 10-Min Higher Low as Key Level",    group=grp_entry)
+require_10m_hl = input.bool(false,  "Require 10-Min Higher Low Structure (longs)", group=grp_entry)
+require_10m_lh = input.bool(false,  "Require 10-Min Lower High Structure (shorts)", group=grp_entry)
+
+use_vwap       = input.bool(true,   "Require VWAP Alignment (9:59 check)",   group=grp_filter)
+use_ema        = input.bool(true,   "Require EMA Alignment (9:59 check)",    group=grp_filter)
+ema_len        = input.int(21,      "EMA Length",                            group=grp_filter, minval=5)
+skip_friday    = input.bool(true,   "Skip Fridays",                          group=grp_filter)
+
+use_smt        = input.bool(true,   "Enable SMT Check",                      group=grp_smt)
+smt_symbol     = input.symbol("ES1!", "Correlated Symbol (ES)",              group=grp_smt)
+
+show_or        = input.bool(true,   "Show Opening Range",                    group=grp_visual)
+show_10m_lvl   = input.bool(true,   "Show 10-Min Key Level",                 group=grp_visual)
+show_vwap_line = input.bool(true,   "Show VWAP",                             group=grp_visual)
+show_ema_line  = input.bool(true,   "Show EMA",                              group=grp_visual)
+show_pdhl      = input.bool(true,   "Show Previous Day H/L",                 group=grp_visual)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIME HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+tz         = "America/New_York"
+ny_hour    = hour(time, tz)
+ny_minute  = minute(time, tz)
+ny_dow     = dayofweek(time, tz)   // 1=Sun … 6=Fri … 7=Sat
+
+is_930          = ny_hour == 9  and ny_minute == 30
+is_959          = ny_hour == 9  and ny_minute == 59
+is_10am_open    = ny_hour == 10 and ny_minute == 0
+in_or           = ny_hour == 9  and ny_minute >= 30
+in_window       = ny_hour == 10 and ny_minute <= entry_window
+past_max        = ny_hour >= max_hold_hour
+
+is_new_session  = ta.change(time("D")) != 0 and is_930
+day_ok          = not (skip_friday and ny_dow == 6)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VWAP & EMA
+// ─────────────────────────────────────────────────────────────────────────────
+
+[vwap_val, _, _] = ta.vwap(hlc3, false, 1)
+ema_val          = ta.ema(close, ema_len)
+
+plot(show_vwap_line ? vwap_val : na, "VWAP",                color=color.new(color.purple, 0), linewidth=2)
+plot(show_ema_line  ? ema_val  : na, "EMA " + str.tostring(ema_len), color=color.new(color.orange, 0), linewidth=1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREVIOUS DAY HIGH / LOW
+// ─────────────────────────────────────────────────────────────────────────────
+
+pd_high_raw = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_off)
+pd_low_raw  = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_off)
+
+var float pd_high = na
+var float pd_low  = na
+
+if is_new_session
+    pd_high := pd_high_raw
+    pd_low  := pd_low_raw
+
+plot(show_pdhl ? pd_high : na, "PDH", color=color.new(color.aqua, 20), linewidth=1, style=plot.style_linebr)
+plot(show_pdhl ? pd_low  : na, "PDL", color=color.new(color.aqua, 20), linewidth=1, style=plot.style_linebr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPENING RANGE  9:30 – 9:59 AM  (30 × 1-min bars)
+// ─────────────────────────────────────────────────────────────────────────────
+
+var float or_high     = na
+var float or_low      = na
+var bool  or_complete = false
+
+if is_new_session
+    or_high     := na
+    or_low      := na
+    or_complete := false
+
+if in_or
+    or_high := na(or_high) ? high : math.max(or_high, high)
+    or_low  := na(or_low)  ? low  : math.min(or_low,  low)
+
+if is_959 and barstate.isconfirmed
+    or_complete := true
+
+plot(or_complete ? or_high : na, "OR High", color=color.new(color.yellow, 20), linewidth=1, style=plot.style_linebr)
+plot(or_complete ? or_low  : na, "OR Low",  color=color.new(color.yellow, 20), linewidth=1, style=plot.style_linebr)
+plot(or_complete ? (or_high + or_low) / 2 : na, "OR Mid", color=color.new(color.yellow, 70), linewidth=1, style=plot.style_linebr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10-MINUTE STRUCTURAL LEVELS
+//
+// At 9:59 AM on a 1-min chart, the last CLOSED 10-min bar is 9:40–9:50.
+//   ten_m_l  = low  of the 9:40–9:50 bar  ← this is the "10-min higher low"
+//   ten_m_l1 = low  of the 9:30–9:40 bar
+//   ten_m_hl = true when 9:40–9:50 low > 9:30–9:40 low (higher low structure)
+// ─────────────────────────────────────────────────────────────────────────────
+
+ten_m_l  = request.security(syminfo.tickerid, "10", low,     lookahead=barmerge.lookahead_off)
+ten_m_l1 = request.security(syminfo.tickerid, "10", low[1],  lookahead=barmerge.lookahead_off)
+ten_m_h  = request.security(syminfo.tickerid, "10", high,    lookahead=barmerge.lookahead_off)
+ten_m_h1 = request.security(syminfo.tickerid, "10", high[1], lookahead=barmerge.lookahead_off)
+
+var float ten_m_key_low   = na    // 10-min higher low = the sweep target for longs
+var float ten_m_key_high  = na    // 10-min lower high = the sweep target for shorts
+var bool  ten_m_hl        = false // True = 10-min structure is bullish (higher low)
+var bool  ten_m_lh        = false // True = 10-min structure is bearish (lower high)
+
+if is_959 and barstate.isconfirmed
+    ten_m_key_low  := ten_m_l
+    ten_m_key_high := ten_m_h
+    ten_m_hl       := not na(ten_m_l) and not na(ten_m_l1) and ten_m_l > ten_m_l1
+    ten_m_lh       := not na(ten_m_h) and not na(ten_m_h1) and ten_m_h < ten_m_h1
+
+// Primary sweep level: 10-min key level when enabled, fallback to OR level
+// For longs  : composite_low  = 10-min higher low   (or OR low if 10m not enabled)
+// For shorts : composite_high = 10-min lower high   (or OR high if 10m not enabled)
+composite_low  = use_10m_level and not na(ten_m_key_low)  ? ten_m_key_low  : or_low
+composite_high = use_10m_level and not na(ten_m_key_high) ? ten_m_key_high : or_high
+
+// Overlay lines for the 10-min levels
+plot(show_10m_lvl and not na(ten_m_key_low)  ? ten_m_key_low  : na,
+     "10M Key Low",  color=color.new(color.lime, 30), linewidth=2, style=plot.style_linebr)
+plot(show_10m_lvl and not na(ten_m_key_high) ? ten_m_key_high : na,
+     "10M Key High", color=color.new(color.red,  30), linewidth=2, style=plot.style_linebr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BIAS  (assessed at the close of the 9:59 bar)
+// ─────────────────────────────────────────────────────────────────────────────
+
+var bool bias_bull = false
+var bool bias_bear = false
+
+if is_959 and barstate.isconfirmed and or_complete
+    vwap_ok = use_vwap ? close > vwap_val : true
+    ema_ok  = use_ema  ? close > ema_val  : true
+    or_mid  = (or_high + or_low) / 2
+    or_ok   = close > or_mid
+
+    bull_ct = (vwap_ok ? 1 : 0) + (ema_ok ? 1 : 0) + (or_ok ? 1 : 0)
+    bear_ct = (not vwap_ok ? 1 : 0) + (not ema_ok ? 1 : 0) + (not or_ok ? 1 : 0)
+
+    // At least 2 of 3 must agree; also respect VWAP and EMA hard filters
+    bias_bull := bull_ct >= 2 and (use_vwap ? vwap_ok : true) and (use_ema ? ema_ok : true)
+    bias_bear := bear_ct >= 2 and (use_vwap ? not vwap_ok : true) and (use_ema ? not ema_ok : true)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SMT DATA  (ES 1-min data compared bar-for-bar with NQ)
+// ─────────────────────────────────────────────────────────────────────────────
+
+corr_low  = use_smt ? request.security(smt_symbol, timeframe.period, low,  lookahead=barmerge.lookahead_off) : na
+corr_high = use_smt ? request.security(smt_symbol, timeframe.period, high, lookahead=barmerge.lookahead_off) : na
+
+// Track correlated OR levels
+var float corr_or_low  = na
+var float corr_or_high = na
+
+if use_smt
+    if is_new_session
+        corr_or_low  := na
+        corr_or_high := na
+    if in_or
+        corr_or_low  := na(corr_or_low)  ? corr_low  : math.min(corr_or_low,  corr_low)
+        corr_or_high := na(corr_or_high) ? corr_high : math.max(corr_or_high, corr_high)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1-MINUTE SWEEP STATE MACHINE
+//
+// States for each direction are tracked independently so both can be detected
+// simultaneously (though the bias filter ensures only one direction is active).
+//
+// BULL side:
+//   watching_bull  → sweep detected below composite_low  → sweeping_bull
+//   sweeping_bull  → price closes back above composite_low → entry_bull
+//
+// BEAR side:
+//   watching_bear  → sweep detected above composite_high → sweeping_bear
+//   sweeping_bear  → price closes back below composite_high → entry_bear
+// ─────────────────────────────────────────────────────────────────────────────
+
+var bool  watching_bull = false
+var bool  watching_bear = false
+var bool  sweeping_bull = false
+var bool  sweeping_bear = false
+var bool  entry_bull    = false
+var bool  entry_bear    = false
+var bool  done_today    = false
+
+var float sweep_low_extreme  = na   // Lowest 1-min wick during bull sweep
+var float sweep_high_extreme = na   // Highest 1-min wick during bear sweep
+var float bull_sweep_size    = na   // Size of the sweep in NQ points
+var float bear_sweep_size    = na
+var bool  smt_bull           = false
+var bool  smt_bear           = false
+
+// Reset at session start
+if is_new_session
+    watching_bull := false;  watching_bear := false
+    sweeping_bull := false;  sweeping_bear := false
+    entry_bull    := false;  entry_bear    := false
+    done_today    := false
+    sweep_low_extreme  := na;  sweep_high_extreme := na
+    bull_sweep_size    := na;  bear_sweep_size    := na
+    smt_bull := false;  smt_bear := false
+
+// Activate watching at 10:00 AM (first 1-min bar)
+if is_10am_open and barstate.isconfirmed and not done_today and day_ok
+    watching_bull := bias_bull
+    watching_bear := bias_bear
+
+// ── BULL SWEEP DETECTION ──────────────────────────────────────────────────────
+
+// Step 1: First bar that wicks below the key level
+if watching_bull and in_window and barstate.isconfirmed
+    if not na(composite_low)
+        swept = composite_low - low
+        if swept >= min_sweep_pts
+            sweeping_bull      := true
+            watching_bull      := false
+            sweep_low_extreme  := low
+            bull_sweep_size    := swept
+            // SMT: ES did not make an equivalent sweep
+            if use_smt and not na(corr_or_low)
+                corr_swept = corr_or_low - corr_low
+                smt_bull   := math.max(corr_swept, 0.0) < swept * 0.5
+
+// Step 2: Track the deepest wick; fire when price closes back above the level
+if sweeping_bull and in_window and barstate.isconfirmed
+    sweep_low_extreme := math.min(sweep_low_extreme, low)
+    if low < composite_low  // Keep updating sweep size if still going lower
+        bull_sweep_size := composite_low - sweep_low_extreme
+    if close > composite_low  // Reversal close → entry ready
+        entry_bull    := true
+        sweeping_bull := false
+
+// ── BEAR SWEEP DETECTION ──────────────────────────────────────────────────────
+
+// Step 1: First bar that wicks above the key level
+if watching_bear and in_window and barstate.isconfirmed
+    if not na(composite_high)
+        swept = high - composite_high
+        if swept >= min_sweep_pts
+            sweeping_bear      := true
+            watching_bear      := false
+            sweep_high_extreme := high
+            bear_sweep_size    := swept
+            if use_smt and not na(corr_or_high)
+                corr_swept = corr_high - corr_or_high
+                smt_bear   := math.max(corr_swept, 0.0) < swept * 0.5
+
+// Step 2: Track highest wick; fire when price closes back below the level
+if sweeping_bear and in_window and barstate.isconfirmed
+    sweep_high_extreme := math.max(sweep_high_extreme, high)
+    if high > composite_high
+        bear_sweep_size := sweep_high_extreme - composite_high
+    if close < composite_high
+        entry_bear    := true
+        sweeping_bear := false
+
+// ── WINDOW EXPIRY ─────────────────────────────────────────────────────────────
+
+// If no entry by end of window, stand down for the day
+if not in_window and barstate.isconfirmed and not done_today
+    if watching_bull or watching_bear or sweeping_bull or sweeping_bear
+        watching_bull := false;  watching_bear := false
+        sweeping_bull := false;  sweeping_bear := false
+        done_today    := true
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY, STOP, AND TARGETS
+//
+// strategy.entry() fires on the CLOSE of the sweep reversal bar.
+// The fill executes at the OPEN of the very next 1-min bar.
+// Stop is placed 2 pts beyond the 1-min sweep wick — significantly tighter
+// than the 5-min stop that spans the full 10:00 AM 5-min candle range.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var float entry_price = na
+var float stop_price  = na
+var float risk_amt    = na
+var float t1_price    = na
+var float t2_price    = na
+var bool  be_moved    = false
+
+// ── LONG ENTRY ────────────────────────────────────────────────────────────────
+
+long_struct_ok = not require_10m_hl or ten_m_hl  // Optional 10-min structure filter
+
+if entry_bull and not done_today and strategy.position_size == 0 and barstate.isconfirmed and long_struct_ok
+    entry_price := open                                  // Fills at next bar open
+    stop_price  := sweep_low_extreme - stop_buffer       // 2 pts below 1-min wick extreme
+    risk_amt    := entry_price - stop_price
+    t1_price    := entry_price + risk_amt * tp1_r
+    t2_price    := entry_price + risk_amt * tp2_r
+    be_moved    := false
+
+    strategy.entry("Long_1M", strategy.long)
+    strategy.exit("L_TP1", "Long_1M", qty_percent=tp1_exit_pct, limit=t1_price, stop=stop_price, comment="T1")
+    strategy.exit("L_TP2", "Long_1M", qty_percent=tp2_exit_pct, limit=t2_price, stop=stop_price, comment="T2")
+    strategy.exit("L_SL",  "Long_1M", stop=stop_price, comment="SL")
+
+    done_today := true
+    entry_bull := false
+
+// ── SHORT ENTRY ───────────────────────────────────────────────────────────────
+
+short_struct_ok = not require_10m_lh or ten_m_lh
+
+if entry_bear and not done_today and strategy.position_size == 0 and barstate.isconfirmed and short_struct_ok
+    entry_price := open
+    stop_price  := sweep_high_extreme + stop_buffer
+    risk_amt    := stop_price - entry_price
+    t1_price    := entry_price - risk_amt * tp1_r
+    t2_price    := entry_price - risk_amt * tp2_r
+    be_moved    := false
+
+    strategy.entry("Short_1M", strategy.short)
+    strategy.exit("S_TP1", "Short_1M", qty_percent=tp1_exit_pct, limit=t1_price, stop=stop_price, comment="T1")
+    strategy.exit("S_TP2", "Short_1M", qty_percent=tp2_exit_pct, limit=t2_price, stop=stop_price, comment="T2")
+    strategy.exit("S_SL",  "Short_1M", stop=stop_price, comment="SL")
+
+    done_today := true
+    entry_bear := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRADE MANAGEMENT
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Move stop to breakeven after Target 1 is touched
+if strategy.position_size > 0 and not be_moved and not na(t1_price)
+    if high >= t1_price
+        strategy.exit("L_BE", from_entry="Long_1M",  stop=entry_price + 0.25, comment="BE")
+        be_moved := true
+
+if strategy.position_size < 0 and not be_moved and not na(t1_price)
+    if low <= t1_price
+        strategy.exit("S_BE", from_entry="Short_1M", stop=entry_price - 0.25, comment="BE")
+        be_moved := true
+
+// Time-based exit: close all positions at max hold hour
+if past_max and strategy.position_size != 0
+    strategy.close_all(comment="Time Exit")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Highlight the entry window
+bgcolor(in_window ? color.new(color.yellow, 92) : na, title="Entry Window")
+
+// Mark sweep-in-progress bars
+bgcolor(sweeping_bull ? color.new(color.lime, 94) : sweeping_bear ? color.new(color.red, 94) : na,
+        title="Active Sweep")
+
+// Entry signal shapes (appear on the reversal bar — fill is at next bar open)
+plotshape(entry_bull and long_struct_ok,
+          "Bull Entry Signal", shape.triangleup, location.belowbar,
+          color=color.new(color.lime, 0), size=size.large, text="1M\nLONG")
+
+plotshape(entry_bear and short_struct_ok,
+          "Bear Entry Signal", shape.triangledown, location.abovebar,
+          color=color.new(color.red, 0),  size=size.large, text="1M\nSHORT")
+
+// SMT markers
+plotshape(entry_bull and smt_bull, "SMT Long",  shape.diamond, location.belowbar,
+          color=color.new(color.lime, 0), size=size.small, text="SMT")
+plotshape(entry_bear and smt_bear, "SMT Short", shape.diamond, location.abovebar,
+          color=color.new(color.red,  0), size=size.small, text="SMT")
+
+// Mark the sweep wick extreme (the exact 1-min low/high of the sweep)
+plotshape(sweeping_bull and low == sweep_low_extreme,
+          "Sweep Wick Low", shape.xcross, location.belowbar,
+          color=color.new(color.yellow, 20), size=size.tiny)
+plotshape(sweeping_bear and high == sweep_high_extreme,
+          "Sweep Wick High", shape.xcross, location.abovebar,
+          color=color.new(color.yellow, 20), size=size.tiny)
+
+// Stop / target lines drawn on the entry bar
+var line ln_entry = na
+var line ln_stop  = na
+var line ln_t1    = na
+var line ln_t2    = na
+
+if (entry_bull and long_struct_ok) or (entry_bear and short_struct_ok)
+    line.delete(ln_entry)
+    line.delete(ln_stop)
+    line.delete(ln_t1)
+    line.delete(ln_t2)
+
+    is_long  = entry_bull and long_struct_ok
+    _stop    = is_long ? (sweep_low_extreme  - stop_buffer) : (sweep_high_extreme + stop_buffer)
+    _entry   = open
+    _risk    = is_long ? (_entry - _stop) : (_stop - _entry)
+    _t1      = is_long ? (_entry + _risk * tp1_r) : (_entry - _risk * tp1_r)
+    _t2      = is_long ? (_entry + _risk * tp2_r) : (_entry - _risk * tp2_r)
+    lc       = is_long ? color.lime : color.red
+
+    if _risk > 0
+        ln_entry := line.new(bar_index, _entry, bar_index + 150, _entry,
+                             color=color.white, width=1, style=line.style_dashed)
+        ln_stop  := line.new(bar_index, _stop,  bar_index + 150, _stop,
+                             color=color.red,   width=2, style=line.style_solid)
+        ln_t1    := line.new(bar_index, _t1,    bar_index + 150, _t1,
+                             color=color.new(lc, 40), width=1, style=line.style_dashed)
+        ln_t2    := line.new(bar_index, _t2,    bar_index + 150, _t2,
+                             color=lc, width=2, style=line.style_solid)
+
+        label.new(bar_index + 152, _stop,
+                  "SL  " + str.tostring(_stop, "#.##") + "\n(" + str.tostring(_risk, "#.#") + " pts risk)",
+                  color=color.new(color.red, 50), textcolor=color.red,
+                  style=label.style_label_right, size=size.small)
+        label.new(bar_index + 152, _t1,
+                  "T1 " + str.tostring(tp1_r, "#.#") + "R  " + str.tostring(_t1, "#.##"),
+                  color=color.new(lc, 60), textcolor=lc,
+                  style=label.style_label_right, size=size.small)
+        label.new(bar_index + 152, _t2,
+                  "T2 " + str.tostring(tp2_r, "#.#") + "R  " + str.tostring(_t2, "#.##"),
+                  color=color.new(lc, 30), textcolor=lc,
+                  style=label.style_label_right, size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTEXT TABLE  (top-left corner)
+// Shows real-time status of every condition the trader needs to know
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table ctx = table.new(position.top_left, 2, 10,
+                          bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(ctx, 0, 0, "Powell 1M",   text_color=color.white,  text_size=size.small, bgcolor=color.new(color.navy, 40))
+    table.cell(ctx, 1, 0, "Status",      text_color=color.white,  text_size=size.small, bgcolor=color.new(color.navy, 40))
+
+    // Bias
+    b_str = bias_bull ? "BULL" : bias_bear ? "BEAR" : "NEUTRAL"
+    b_col = bias_bull ? color.lime : bias_bear ? color.red : color.gray
+    table.cell(ctx, 0, 1, "Bias (9:59)", text_color=color.gray,   text_size=size.small)
+    table.cell(ctx, 1, 1, b_str,         text_color=b_col,         text_size=size.small)
+
+    // 10-min higher low
+    hl_str = ten_m_hl ? "YES  ✓" : "NO"
+    hl_col = ten_m_hl ? color.lime : color.gray
+    table.cell(ctx, 0, 2, "10M Higher Low", text_color=color.gray, text_size=size.small)
+    table.cell(ctx, 1, 2, hl_str,           text_color=hl_col,     text_size=size.small)
+
+    // 10-min lower high
+    lh_str = ten_m_lh ? "YES  ✓" : "NO"
+    lh_col = ten_m_lh ? color.lime : color.gray
+    table.cell(ctx, 0, 3, "10M Lower High", text_color=color.gray, text_size=size.small)
+    table.cell(ctx, 1, 3, lh_str,           text_color=lh_col,     text_size=size.small)
+
+    // Key sweep level
+    kl_str = not na(composite_low) ? str.tostring(composite_low, "#.##") : "--"
+    kh_str = not na(composite_high) ? str.tostring(composite_high, "#.##") : "--"
+    table.cell(ctx, 0, 4, "Bull Target", text_color=color.gray,  text_size=size.small)
+    table.cell(ctx, 1, 4, kl_str,        text_color=color.lime,  text_size=size.small)
+    table.cell(ctx, 0, 5, "Bear Target", text_color=color.gray,  text_size=size.small)
+    table.cell(ctx, 1, 5, kh_str,        text_color=color.red,   text_size=size.small)
+
+    // SMT
+    smt_str = smt_bull ? "BULL ✓" : smt_bear ? "BEAR ✓" : "Pending"
+    smt_col = (smt_bull or smt_bear) ? color.lime : color.gray
+    table.cell(ctx, 0, 6, "SMT",    text_color=color.gray, text_size=size.small)
+    table.cell(ctx, 1, 6, smt_str,  text_color=smt_col,    text_size=size.small)
+
+    // Day state
+    ds_str = done_today ? "Done" : in_window ? "Window Open" : ny_hour < 10 ? "Pre-10AM" : "Window Closed"
+    ds_col = done_today ? color.gray : in_window ? color.yellow : color.gray
+    table.cell(ctx, 0, 7, "Day State", text_color=color.gray, text_size=size.small)
+    table.cell(ctx, 1, 7, ds_str,      text_color=ds_col,     text_size=size.small)
+
+    // Backtest stats
+    tot = strategy.closedtrades
+    wr  = tot > 0 ? strategy.wintrades / tot * 100.0 : 0.0
+    pf  = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0.0
+    table.cell(ctx, 0, 8, "Win Rate",  text_color=color.gray, text_size=size.small)
+    table.cell(ctx, 1, 8, str.tostring(wr, "#.1") + "% (" + str.tostring(tot) + ")",
+               text_color=wr >= 60 ? color.lime : color.red, text_size=size.small)
+    table.cell(ctx, 0, 9, "Prof Factor", text_color=color.gray, text_size=size.small)
+    table.cell(ctx, 1, 9, str.tostring(pf, "#.##"),
+               text_color=pf >= 1.5 ? color.lime : color.red, text_size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(entry_bull and long_struct_ok and smt_bull,
+               "1M Long + SMT",   "Powell 1M: LONG sweep complete + SMT on {{ticker}} — enter at next bar open")
+alertcondition(entry_bear and short_struct_ok and smt_bear,
+               "1M Short + SMT",  "Powell 1M: SHORT sweep complete + SMT on {{ticker}} — enter at next bar open")
+alertcondition(entry_bull and long_struct_ok,
+               "1M Long Signal",  "Powell 1M: LONG sweep reversal on {{ticker}} at {{close}} — enter at next bar open")
+alertcondition(entry_bear and short_struct_ok,
+               "1M Short Signal", "Powell 1M: SHORT sweep reversal on {{ticker}} at {{close}} — enter at next bar open")
+alertcondition(sweeping_bull,
+               "1M Bull Sweep In Progress",  "Powell 1M: Bull sweep below key level developing on {{ticker}}")
+alertcondition(sweeping_bear,
+               "1M Bear Sweep In Progress",  "Powell 1M: Bear sweep above key level developing on {{ticker}}")
