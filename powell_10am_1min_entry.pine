@@ -256,13 +256,19 @@ var bool  smt_bear           = false
 
 // Reset at session start
 if is_new_session
-    watching_bull := false;  watching_bear := false
-    sweeping_bull := false;  sweeping_bear := false
-    entry_bull    := false;  entry_bear    := false
-    done_today    := false
-    sweep_low_extreme  := na;  sweep_high_extreme := na
-    bull_sweep_size    := na;  bear_sweep_size    := na
-    smt_bull := false;  smt_bear := false
+    watching_bull      := false
+    watching_bear      := false
+    sweeping_bull      := false
+    sweeping_bear      := false
+    entry_bull         := false
+    entry_bear         := false
+    done_today         := false
+    sweep_low_extreme  := na
+    sweep_high_extreme := na
+    bull_sweep_size    := na
+    bear_sweep_size    := na
+    smt_bull           := false
+    smt_bear           := false
 
 // Activate watching at 10:00 AM (first 1-min bar)
 if is_10am_open and barstate.isconfirmed and not done_today and day_ok
@@ -323,8 +329,10 @@ if sweeping_bear and in_window and barstate.isconfirmed
 // If no entry by end of window, stand down for the day
 if not in_window and barstate.isconfirmed and not done_today
     if watching_bull or watching_bear or sweeping_bull or sweeping_bear
-        watching_bull := false;  watching_bear := false
-        sweeping_bull := false;  sweeping_bear := false
+        watching_bull := false
+        watching_bear := false
+        sweeping_bull := false
+        sweeping_bear := false
         done_today    := true
 
 // ─────────────────────────────────────────────────────────────────────────────
