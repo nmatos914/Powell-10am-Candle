@@ -1,0 +1,337 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Powell 10AM Strategy — V1 Visual Indicator
+// For use on NQ1! or MNQ1! 5-minute chart
+// Marks: PDH/PDL, Opening Range, VWAP, EMA, 10AM candle, sweep detection
+
+//@version=5
+indicator(title="Powell 10AM — V1 Indicator", shorttitle="P10AM_V1", overlay=true, max_lines_count=100, max_labels_count=100)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+grp_setup   = "Setup Parameters"
+grp_display = "Display"
+grp_smt     = "SMT Divergence"
+
+min_sweep_pts = input.float(5.0,   "Min Sweep Size (NQ Points)",      group=grp_setup, minval=1.0, step=0.5)
+swing_lb      = input.int(2,       "Swing Detection Lookback (bars)", group=grp_setup, minval=1, maxval=5)
+ema_len       = input.int(21,      "EMA Length",                      group=grp_setup, minval=5)
+
+show_pdhl     = input.bool(true,   "Show Previous Day H/L",           group=grp_display)
+show_or       = input.bool(true,   "Show Opening Range",              group=grp_display)
+show_vwap     = input.bool(true,   "Show VWAP",                       group=grp_display)
+show_ema      = input.bool(true,   "Show EMA 21",                     group=grp_display)
+show_sweeps   = input.bool(true,   "Show Sweep Labels",               group=grp_display)
+show_bias     = input.bool(true,   "Show Bias Score Label",           group=grp_display)
+
+use_smt       = input.bool(true,   "Enable SMT Check",                group=grp_smt)
+smt_symbol    = input.symbol("ES1!", "Correlated Symbol (ES)",        group=grp_smt)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIMEZONE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+tz        = "America/New_York"
+ny_hour   = hour(time, tz)
+ny_minute = minute(time, tz)
+
+is_930  = ny_hour == 9  and ny_minute == 30
+is_955  = ny_hour == 9  and ny_minute == 55
+is_1000 = ny_hour == 10 and ny_minute == 0
+is_1005 = ny_hour == 10 and ny_minute == 5
+
+in_or   = ny_hour == 9  and ny_minute >= 30    // Opening Range: 9:30–9:59
+in_trade_window = is_1000 or (ny_hour == 10 and ny_minute > 0 and ny_minute <= 30)
+
+// New session detection (first bar of each trading day)
+is_new_session = ta.change(time("D")) != 0 and is_930
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREVIOUS DAY HIGH / LOW
+// ─────────────────────────────────────────────────────────────────────────────
+
+pd_high_raw = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pd_low_raw  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+pd_close    = request.security(syminfo.tickerid, "D", close[1],lookahead=barmerge.lookahead_off)
+
+var float pd_high = na
+var float pd_low  = na
+
+if is_new_session
+    pd_high := pd_high_raw
+    pd_low  := pd_low_raw
+
+pd_high_line = show_pdhl ? plot(pd_high, "PDH", color=color.new(color.aqua, 0), linewidth=1, style=plot.style_linebr) : na
+pd_low_line  = show_pdhl ? plot(pd_low,  "PDL", color=color.new(color.aqua, 0), linewidth=1, style=plot.style_linebr) : na
+
+if show_pdhl and is_new_session and not na(pd_high)
+    label.new(bar_index, pd_high, "PDH: " + str.tostring(pd_high, "#.##"),
+              style=label.style_label_right, color=color.new(color.aqua, 70), textcolor=color.aqua, size=size.small)
+    label.new(bar_index, pd_low, "PDL: " + str.tostring(pd_low, "#.##"),
+              style=label.style_label_right, color=color.new(color.aqua, 70), textcolor=color.aqua, size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPENING RANGE
+// ─────────────────────────────────────────────────────────────────────────────
+
+var float or_high     = na
+var float or_low      = na
+var bool  or_complete = false
+
+if is_new_session
+    or_high     := na
+    or_low      := na
+    or_complete := false
+
+if in_or
+    or_high := na(or_high) ? high : math.max(or_high, high)
+    or_low  := na(or_low)  ? low  : math.min(or_low,  low)
+
+if is_955 and barstate.isconfirmed
+    or_complete := true
+
+// Draw OR box (from 9:30 to 10:00)
+var box or_box = na
+
+if is_955 and barstate.isconfirmed and show_or and not na(or_high)
+    box.delete(or_box)
+    or_box := box.new(bar_index - 5, or_high, bar_index + 50, or_low,
+                      border_color=color.new(color.yellow, 20),
+                      bgcolor=color.new(color.yellow, 88),
+                      border_width=1, border_style=line.style_dashed)
+
+// Plot OR lines after completion
+plot(or_complete ? or_high : na, "OR High", color=color.new(color.yellow, 20), linewidth=1, style=plot.style_linebr)
+plot(or_complete ? or_low  : na, "OR Low",  color=color.new(color.yellow, 20), linewidth=1, style=plot.style_linebr)
+plot(or_complete ? (or_high + or_low) / 2 : na, "OR Mid", color=color.new(color.yellow, 60), linewidth=1, style=plot.style_linebr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VWAP
+// ─────────────────────────────────────────────────────────────────────────────
+
+[vwap_val, _, _] = ta.vwap(hlc3, false, 1)
+plot(show_vwap ? vwap_val : na, "VWAP", color=color.new(color.purple, 0), linewidth=2)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EMA
+// ─────────────────────────────────────────────────────────────────────────────
+
+ema21 = ta.ema(close, ema_len)
+plot(show_ema ? ema21 : na, "EMA 21", color=color.new(color.orange, 0), linewidth=1)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BIAS CALCULATION AT 9:55
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int   bias_score_bull = 0
+var int   bias_score_bear = 0
+var bool  vwap_bull       = false
+var bool  or_pos_bull     = false
+var bool  ema_bull        = false
+var bool  pd_bull         = false
+
+if is_955 and barstate.isconfirmed and not na(or_high)
+    vwap_bull   := close > vwap_val
+    or_pos_bull := close > (or_high + or_low) / 2
+    ema_bull    := close > ema21
+    pd_bull     := not na(pd_close) and open >= pd_close  // Today's open above prior close
+
+    bias_score_bull := (vwap_bull ? 1 : 0) + (or_pos_bull ? 1 : 0) + (ema_bull ? 1 : 0)
+    bias_score_bear := (not vwap_bull ? 1 : 0) + (not or_pos_bull ? 1 : 0) + (not ema_bull ? 1 : 0)
+
+    if show_bias
+        bull_bias = bias_score_bull >= 2
+        bear_bias = bias_score_bear >= 2
+        bias_str  = bull_bias ? "BULLISH (" + str.tostring(bias_score_bull) + "/3)" :
+                    bear_bias ? "BEARISH (" + str.tostring(bias_score_bear) + "/3)" :
+                    "NEUTRAL — SKIP"
+        bias_col  = bull_bias ? color.lime : bear_bias ? color.red : color.gray
+        label.new(bar_index, high, "9:55 Bias: " + bias_str,
+                  style=label.style_label_down, color=color.new(bias_col, 70), textcolor=bias_col, size=size.normal)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SWING HIGH / LOW DETECTION (Pre-10 AM only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+var float last_swing_high = na
+var float last_swing_low  = na
+
+raw_ph = ta.pivothigh(high, swing_lb, swing_lb)
+raw_pl = ta.pivotlow (low,  swing_lb, swing_lb)
+
+// Confirm pivot at bar_index - swing_lb (the actual pivot bar)
+pivot_bar_hour   = hour(time[swing_lb], tz)
+pivot_bar_minute = minute(time[swing_lb], tz)
+pivot_before_10am = pivot_bar_hour < 10 or (pivot_bar_hour == 9 and pivot_bar_minute >= 30)
+
+if not na(raw_ph) and pivot_before_10am
+    last_swing_high := raw_ph
+if not na(raw_pl) and pivot_before_10am
+    last_swing_low := raw_pl
+
+// Reset swings at start of new session
+if is_new_session
+    last_swing_high := na
+    last_swing_low  := na
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SMT DIVERGENCE DATA
+// ─────────────────────────────────────────────────────────────────────────────
+
+corr_high = use_smt ? request.security(smt_symbol, timeframe.period, high, lookahead=barmerge.lookahead_off) : na
+corr_low  = use_smt ? request.security(smt_symbol, timeframe.period, low,  lookahead=barmerge.lookahead_off) : na
+
+// Track the correlated instrument's OR levels
+var float corr_or_high = na
+var float corr_or_low  = na
+
+if use_smt
+    if is_new_session
+        corr_or_high := na
+        corr_or_low  := na
+    if in_or
+        corr_or_high := na(corr_or_high) ? corr_high : math.max(corr_or_high, corr_high)
+        corr_or_low  := na(corr_or_low)  ? corr_low  : math.min(corr_or_low,  corr_low)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10 AM CANDLE ANALYSIS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Key liquidity levels: OR high/low take priority over swing high/low
+key_low  = not na(or_low)  ? math.min(or_low,  not na(last_swing_low)  ? last_swing_low  : or_low)  : last_swing_low
+key_high = not na(or_high) ? math.max(or_high, not na(last_swing_high) ? last_swing_high : or_high) : last_swing_high
+
+var bool bull_sweep_detected = false
+var bool bear_sweep_detected = false
+var float sweep_low_val  = na
+var float sweep_high_val = na
+var bool smt_confirmed_bull = false
+var bool smt_confirmed_bear = false
+var float ten_am_candle_high = na
+var float ten_am_candle_low  = na
+
+// Analyze on confirmed close of the 10:00 AM candle
+if is_1000 and barstate.isconfirmed
+    ten_am_candle_high := high
+    ten_am_candle_low  := low
+
+    // Bullish sweep: wick goes below key low, closes back above
+    if not na(key_low)
+        swept_below = key_low - low
+        if swept_below >= min_sweep_pts and close > key_low
+            bull_sweep_detected := true
+            sweep_low_val := low
+
+            // SMT: correlated instrument did NOT sweep its equivalent low
+            if use_smt and not na(corr_or_low)
+                corr_sweep = corr_or_low - corr_low
+                smt_confirmed_bull := corr_sweep < min_sweep_pts * 0.5  // ES barely swept or didn't
+
+    // Bearish sweep: wick goes above key high, closes back below
+    if not na(key_high)
+        swept_above = high - key_high
+        if swept_above >= min_sweep_pts and close < key_high
+            bear_sweep_detected := true
+            sweep_high_val := high
+
+            // SMT: correlated instrument did NOT sweep its equivalent high
+            if use_smt and not na(corr_or_high)
+                corr_sweep = corr_high - corr_or_high
+                smt_confirmed_bear := corr_sweep < min_sweep_pts * 0.5
+
+    // Label the 10 AM candle
+    if bull_sweep_detected and show_sweeps
+        bull_str = "⬆ BULL SWEEP\n" +
+                   str.tostring(key_low - low, "#.#") + " pts below key low" +
+                   (smt_confirmed_bull ? "\n✅ SMT Confirmed" : "\n⚠ No SMT")
+        label.new(bar_index, low, bull_str, style=label.style_label_up,
+                  color=color.new(color.lime, 20), textcolor=color.black, size=size.normal)
+
+    if bear_sweep_detected and show_sweeps
+        bear_str = "⬇ BEAR SWEEP\n" +
+                   str.tostring(high - key_high, "#.#") + " pts above key high" +
+                   (smt_confirmed_bear ? "\n✅ SMT Confirmed" : "\n⚠ No SMT")
+        label.new(bar_index, high, bear_str, style=label.style_label_down,
+                  color=color.new(color.red, 20), textcolor=color.white, size=size.normal)
+
+    // Neither condition: mark as no setup
+    if not bull_sweep_detected and not bear_sweep_detected and show_sweeps
+        label.new(bar_index, high, "No Setup\n(No valid sweep)", style=label.style_label_down,
+                  color=color.new(color.gray, 50), textcolor=color.white, size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTRY SIGNAL AT 10:05 AM
+// ─────────────────────────────────────────────────────────────────────────────
+
+bull_bias_active = bias_score_bull >= 2
+bear_bias_active = bias_score_bear >= 2
+
+long_signal  = is_1005 and bull_sweep_detected and bull_bias_active
+short_signal = is_1005 and bear_sweep_detected and bear_bias_active
+
+// V1.0 aggressive entry signals
+plotshape(long_signal,  title="Long Signal",  style=shape.triangleup,   location=location.belowbar,
+          color=color.new(color.lime, 0), size=size.huge, text="LONG")
+plotshape(short_signal, title="Short Signal", style=shape.triangledown, location=location.abovebar,
+          color=color.new(color.red, 0),  size=size.huge, text="SHORT")
+
+// Entry level lines
+var line entry_line = na
+var line stop_line  = na
+var line t1_line    = na
+var line t2_line    = na
+
+atr14 = ta.atr(14)
+
+if long_signal
+    entry  = close
+    stop   = sweep_low_val - 3.0
+    risk   = entry - stop
+    t1     = entry + risk * 1.0
+    t2     = entry + risk * 2.0
+    line.delete(entry_line)
+    line.delete(stop_line)
+    line.delete(t1_line)
+    line.delete(t2_line)
+    entry_line := line.new(bar_index, entry, bar_index + 60, entry, color=color.white,   width=1, style=line.style_dashed)
+    stop_line  := line.new(bar_index, stop,  bar_index + 60, stop,  color=color.red,     width=1, style=line.style_solid)
+    t1_line    := line.new(bar_index, t1,    bar_index + 60, t1,    color=color.new(color.lime,30), width=1, style=line.style_dashed)
+    t2_line    := line.new(bar_index, t2,    bar_index + 60, t2,    color=color.lime,    width=2, style=line.style_solid)
+    label.new(bar_index, stop,  "STOP: "  + str.tostring(stop,  "#.##"), style=label.style_label_right, color=color.new(color.red,50),   textcolor=color.red,   size=size.small)
+    label.new(bar_index, t1,    "T1(1R): "+ str.tostring(t1,    "#.##"), style=label.style_label_right, color=color.new(color.lime,50),  textcolor=color.lime,  size=size.small)
+    label.new(bar_index, t2,    "T2(2R): "+ str.tostring(t2,    "#.##"), style=label.style_label_right, color=color.new(color.lime,20),  textcolor=color.lime,  size=size.small)
+
+if short_signal
+    entry  = close
+    stop   = sweep_high_val + 3.0
+    risk   = stop - entry
+    t1     = entry - risk * 1.0
+    t2     = entry - risk * 2.0
+    line.delete(entry_line)
+    line.delete(stop_line)
+    line.delete(t1_line)
+    line.delete(t2_line)
+    entry_line := line.new(bar_index, entry, bar_index + 60, entry, color=color.white,   width=1, style=line.style_dashed)
+    stop_line  := line.new(bar_index, stop,  bar_index + 60, stop,  color=color.red,     width=1, style=line.style_solid)
+    t1_line    := line.new(bar_index, t1,    bar_index + 60, t1,    color=color.new(color.red,30), width=1, style=line.style_dashed)
+    t2_line    := line.new(bar_index, t2,    bar_index + 60, t2,    color=color.red,     width=2, style=line.style_solid)
+    label.new(bar_index, stop,  "STOP: "  + str.tostring(stop,  "#.##"), style=label.style_label_right, color=color.new(color.red,50),   textcolor=color.red,   size=size.small)
+    label.new(bar_index, t1,    "T1(1R): "+ str.tostring(t1,    "#.##"), style=label.style_label_right, color=color.new(color.red,50),   textcolor=color.red,   size=size.small)
+    label.new(bar_index, t2,    "T2(2R): "+ str.tostring(t2,    "#.##"), style=label.style_label_right, color=color.new(color.red,20),   textcolor=color.red,   size=size.small)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10 AM CANDLE HIGHLIGHT
+// ─────────────────────────────────────────────────────────────────────────────
+
+bgcolor(is_1000 ? color.new(color.yellow, 80) : na, title="10 AM Candle Highlight")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(long_signal  and smt_confirmed_bull, "P10AM Long + SMT",   "Powell 10AM: LONG signal with SMT at {{ticker}} {{close}}")
+alertcondition(short_signal and smt_confirmed_bear, "P10AM Short + SMT",  "Powell 10AM: SHORT signal with SMT at {{ticker}} {{close}}")
+alertcondition(long_signal  and not smt_confirmed_bull, "P10AM Long No SMT",  "Powell 10AM: LONG signal (no SMT) at {{ticker}} {{close}}")
+alertcondition(short_signal and not smt_confirmed_bear, "P10AM Short No SMT", "Powell 10AM: SHORT signal (no SMT) at {{ticker}} {{close}}")
+alertcondition(is_1000, "10AM Candle Open", "Powell 10AM: 10:00 AM candle now open on {{ticker}}")
